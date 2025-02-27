@@ -1,9 +1,11 @@
+import os
 import datetime
 import time
 import pytz
 import logging
 from typing import Dict, List, Tuple, Optional, Any, Set
 from decimal import Decimal
+from dotenv import load_dotenv
 
 from api.tastytrade_api import TastytradeAPI
 from broker.tastytrade_broker import TastytradeBroker
@@ -12,7 +14,7 @@ from broker.tastytrade_broker import TastytradeBroker
 class SPXIronCondorStrategy:
     """
     Implements a 0 DTE SPX Iron Condor trading strategy.
-    
+
     The strategy:
     - Trades 0 DTE SPX iron condors at 10:10 AM Eastern time
     - Uses a max of $100,000 buying power
@@ -23,26 +25,29 @@ class SPXIronCondorStrategy:
     - Monitors short calls and puts separately
     - Exits when cost to close exceeds 90% of credit received for at least 2 minutes
     - Lets untested sides and wings run to expiration
-    
+
     Features:
     - Scans for existing iron condor positions at startup
     - Uses actual account buying power for position sizing
     - Applies consistent exit rules to both new and existing positions
     """
-    
+
     def __init__(self, api: TastytradeAPI, broker: TastytradeBroker):
         """
         Initialize the strategy with API and broker instances.
-        
+
         Args:
             api: Authenticated TastytradeAPI instance
             broker: TastytradeBroker instance
         """
+        # Load environment variables
+        load_dotenv()
+
         self.api = api
         self.broker = broker
         self.account_number = None
         self.max_buying_power = 100000.0
-        
+
         # Strategy configuration
         self.entry_time_eastern = "10:10"
         self.target_delta_min = 0.16
@@ -54,11 +59,11 @@ class SPXIronCondorStrategy:
         self.max_iron_condors = 6
         self.exit_threshold = 0.90  # Exit when cost to close exceeds 90% of credit
         self.exit_confirmation_time = 120  # 2 minutes in seconds
-        
+
         # Strategy state
         self.active_trades = []
         self.monitoring = False
-        
+
         # Set up logging
         logging.basicConfig(
             level=logging.INFO,
@@ -69,17 +74,53 @@ class SPXIronCondorStrategy:
             ]
         )
         self.logger = logging.getLogger(__name__)
-    
+
+    def select_account(self) -> bool:
+        """
+        Select the account to use for trading based on environment variable.
+
+        First tries to use the account specified in TASTY_ACCOUNT environment variable.
+        Falls back to the first available account if TASTY_ACCOUNT is not set or not found.
+
+        Returns:
+            True if an account was successfully selected, False otherwise
+        """
+        if not self.broker.accounts:
+            self.logger.error("No accounts available in broker. Check credentials and permissions.")
+            return False
+
+        # Try to get the account from environment variable
+        preferred_account = os.getenv("TASTY_ACCOUNT")
+
+        if preferred_account and preferred_account in self.broker.accounts:
+            self.account_number = preferred_account
+            self.logger.info(f"Using account from TASTY_ACCOUNT: {self.account_number}")
+            return True
+
+        elif preferred_account:
+            self.logger.warning(f"Specified account {preferred_account} not found in available accounts.")
+            self.logger.warning(f"Available accounts: {list(self.broker.accounts.keys())}")
+
+        # Fall back to first account
+        self.account_number = list(self.broker.accounts.keys())[0]
+        self.logger.info(f"Using first available account: {self.account_number}")
+        return True
+
     def set_account(self, account_number: str) -> None:
         """
         Set the account number to use for trading.
-        
+
         Args:
             account_number: The account number to use
         """
-        self.account_number = account_number
-        self.logger.info(f"Using account: {account_number}")
-    
+        if account_number in self.broker.accounts:
+            self.account_number = account_number
+            self.logger.info(f"Using account: {account_number}")
+        else:
+            self.logger.error(f"Account {account_number} not found in available accounts.")
+            self.logger.error(f"Available accounts: {list(self.broker.accounts.keys())}")
+            raise ValueError(f"Account {account_number} not found in available accounts.")
+
     def is_entry_time(self) -> bool:
         """
         Check if it's time to enter trades based on the configured entry time.
@@ -771,10 +812,11 @@ class SPXIronCondorStrategy:
     
     def run(self) -> None:
         """Main method to run the trading strategy."""
+        # Select account if not already set
         if not self.account_number:
-            self.logger.error("Account number not set. Call set_account() first.")
-            return
-            
+            if not self.select_account():
+                self.logger.error("No valid account available. Exiting.")
+                return
         self.logger.info("Starting SPX Iron Condor Strategy")
         
         # First, ensure we're subscribed to SPX option data
@@ -867,13 +909,11 @@ if __name__ == "__main__":
     
     # Initialize strategy
     strategy = SPXIronCondorStrategy(api, broker)
-    
-    # Set account - use first account if available
-    if broker.accounts:
-        account_number = list(broker.accounts.keys())[0]
-        strategy.set_account(account_number)
-        
-        # Run strategy
-        strategy.run()
-    else:
+
+    # Let the strategy select the account from environment or fall back to first account
+    if not strategy.select_account():
         print("No accounts found. Please check your credentials.")
+        exit(1)
+
+    # Run strategy
+    strategy.run()

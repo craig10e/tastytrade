@@ -50,6 +50,7 @@ TASTY_USERNAME=your_username
 TASTY_PASSWORD=your_password
 TASTY_BASE_URL=https://api.tastytrade.com
 TASTY_STREAMER_URL=wss://streamer.tastytrade.com
+TASTY_ACCOUNT=your_account_number  # Specify which account to use for trading
 ```
 
 For sandbox/development use, you can use:
@@ -96,13 +97,22 @@ api.create_option_order(
 ### Broker
 
 ```python
+import os
+from dotenv import load_dotenv
 from broker.tastytrade_broker import TastytradeBroker
+
+# Load environment variables
+load_dotenv()
 
 # Initialize broker
 broker = TastytradeBroker()
 
-# Access accounts
-account_number = list(broker.accounts.keys())[0] if broker.accounts else None
+# Get account from environment variable or use first available
+preferred_account = os.getenv("TASTY_ACCOUNT")
+if preferred_account and preferred_account in broker.accounts:
+    account_number = preferred_account
+else:
+    account_number = list(broker.accounts.keys())[0] if broker.accounts else None
 
 # Start streaming service
 broker.start_streaming_service(account_number)
@@ -133,18 +143,16 @@ from strategies.spx_iron_condor_strategy import SPXIronCondorStrategy
 api = TastytradeAPI()
 broker = TastytradeBroker()
 
-# Get account
-account_number = list(broker.accounts.keys())[0] if broker.accounts else None
-if not account_number:
-    print("No accounts found")
+# Initialize strategy
+strategy = SPXIronCondorStrategy(api, broker)
+
+# Let the strategy select the account (uses TASTY_ACCOUNT env var or falls back to first account)
+if not strategy.select_account():
+    print("No accounts found. Please check your credentials.")
     exit(1)
 
 # Start data streaming
-broker.start_streaming_service(account_number)
-
-# Initialize strategy
-strategy = SPXIronCondorStrategy(api, broker)
-strategy.set_account(account_number)
+broker.start_streaming_service(strategy.account_number)
 
 # Run strategy
 strategy.run()
@@ -182,6 +190,24 @@ tastytrade/
 - pytz
 
 ## Advanced Features
+
+### Account Selection
+
+The library supports selecting a specific trading account using the TASTY_ACCOUNT environment variable:
+
+```python
+# In your .env file
+TASTY_ACCOUNT=your_account_number
+
+# In your code
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+# Strategy will automatically use the account from the environment variable
+strategy = SPXIronCondorStrategy(api, broker)
+strategy.select_account()  # Uses TASTY_ACCOUNT or falls back to first account
+```
 
 ### Market Data Streaming
 
