@@ -7,7 +7,7 @@ This guide explains how to set up and run the SPX Iron Condor Strategy.
 This strategy implements 0 DTE (0 Days To Expiration) SPX Iron Condor trades with the following specifications:
 
 - **Entry Time**: 10:10 AM Eastern (8:10 AM Utah time)
-- **Budget**: $100,000 max buying power
+- **Budget**: $100,000 max buying power (dynamically adjusted based on actual account balance)
 - **Strike Selection**: 16-25 delta range for short options
 - **Credit Target**: ~$5 for puts and ~$5 for calls (~$10 total per iron condor)
 - **Wing Costs**: $0.15 for put wings, $0.05 for call wings
@@ -16,6 +16,10 @@ This strategy implements 0 DTE (0 Days To Expiration) SPX Iron Condor trades wit
 - **Exit Criteria**:
   - Exit when cost to close exceeds 90% of credit received for at least 2 minutes
   - Let untested sides and wings expire worthless
+- **Position Management**:
+  - Automatically scans for existing iron condor positions at startup
+  - Reconstructs trade details for existing positions
+  - Applies consistent exit rules to both new and existing positions
 
 ### Setup Instructions
 
@@ -43,7 +47,7 @@ api = TastytradeAPI()
 broker = TastytradeBroker()
 
 # Get first account
-account_number = next(iter(broker.accounts.keys()), None)
+account_number = list(broker.accounts.keys())[0] if broker.accounts else None
 if not account_number:
     print("No accounts found. Please check your credentials.")
     exit(1)
@@ -79,22 +83,29 @@ strategy.run()
    - Wing strikes are calculated to provide the desired credit amount
 
 2. **Buying Power Management**:
-   - The strategy calculates buying power reduction per iron condor
-   - It determines the maximum number of contracts possible within the budget
+   - The strategy retrieves actual buying power from the account balance API
+   - It calculates buying power reduction per iron condor
+   - It determines the maximum number of contracts possible within the available buying power
    - It caps at 6 iron condors maximum, regardless of buying power
 
-3. **Trade Execution**:
+3. **Position Management**:
+   - Scans for existing iron condor positions during initialization
+   - Retrieves order history to reconstruct entry details for existing positions
+   - Applies the same monitoring and exit rules to both new and existing positions
+   - Avoids creating duplicate positions if positions already exist for today's expiration
+
+4. **Trade Execution**:
    - Executes at the configured entry time
    - Creates a 4-leg iron condor order at the calculated credit price
    - Tracks active trades for monitoring
 
-4. **Trade Monitoring**:
+5. **Trade Monitoring**:
    - Continuously monitors both short options separately
    - Tracks the cost to close each position
    - If cost to close exceeds 90% of credit received for at least 2 minutes, it exits that side
    - Allows untested sides to expire worthless
 
-5. **Logging**:
+6. **Logging**:
    - Comprehensive logging to both console and log file
    - Tracks all decisions, actions, and trade details
 
@@ -123,7 +134,7 @@ strategy.exit_threshold = 0.90  # Exit at 90% of credit received
 strategy.exit_confirmation_time = 120  # 2 minutes confirmation period
 
 # Position sizing
-strategy.max_buying_power = 100000.0
+strategy.max_buying_power = 100000.0  # Cap on buying power (actual available BP is used)
 strategy.max_iron_condors = 6
 ```
 
@@ -149,6 +160,11 @@ strategy.max_iron_condors = 6
    - Verify all calculations and logic
    - Run through multiple scenario tests before going live
 
+5. **Position Recovery**:
+   - The system can now recover state after restarts by scanning existing positions
+   - Consider adding a database for more robust state persistence
+   - Test the recovery process by intentionally restarting the strategy
+
 ### Troubleshooting
 
 1. **No Strikes Found**:
@@ -165,3 +181,13 @@ strategy.max_iron_condors = 6
    - Ensure market data streaming is working
    - Check for connectivity to the Tastytrade platform
    - Verify that option prices are being updated correctly
+
+4. **Position Detection Issues**:
+   - If existing positions aren't correctly identified, verify API permissions
+   - Check the format of symbols to ensure they match expected patterns
+   - Review logs for any errors during the position scanning process
+
+5. **Credit Estimation Issues**:
+   - If credits for existing positions seem incorrect, they might be using default estimates
+   - Check if the order history API is functioning correctly
+   - Consider manually setting more accurate credit values if needed
