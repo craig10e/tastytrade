@@ -1,15 +1,16 @@
 # Tastytrade Python Trading Library
 
-A comprehensive Python library for automated trading with the Tastytrade platform, providing seamless API integration and broker functionality for options trading strategies.
+A comprehensive Python library for automated options trading with a broker-agnostic architecture, providing seamless API integration and an extensible framework for implementing trading strategies.
 
 ## Overview
 
-This library offers two main components:
+This library offers three main components:
 
 1. **TastytradeAPI**: A Python client for interacting with the Tastytrade REST API and streaming services
 2. **TastytradeBroker**: A high-level broker implementation for managing accounts, positions, and orders
+3. **Trading Strategies**: Broker-agnostic strategies that can work with any compatible broker implementation
 
-Together, these components provide everything needed to build automated trading strategies for the Tastytrade platform.
+The broker-agnostic design allows strategies to be developed independently of the specific brokerage platform, making your trading systems more flexible and portable.
 
 ## Features
 
@@ -29,6 +30,14 @@ Together, these components provide everything needed to build automated trading 
 - Market data monitoring and analysis
 - Symbol tracking with historical data
 - Trend detection for optimal trade entry
+- Standardized interface for strategy integration
+
+### Strategy Features
+- Broker-agnostic implementation
+- Configurable parameters
+- Position monitoring and management
+- Automated entry and exit rules
+- Support for scanning existing positions
 
 ## Installation
 
@@ -48,9 +57,9 @@ Create a `.env` file in your project root with your Tastytrade credentials:
 ```
 TASTY_USERNAME=your_username
 TASTY_PASSWORD=your_password
+TASTY_ACCOUNT=your_account_number  # Specify which account to use for trading
 TASTY_BASE_URL=https://api.tastytrade.com
 TASTY_STREAMER_URL=wss://streamer.tastytrade.com
-TASTY_ACCOUNT=your_account_number  # Specify which account to use for trading
 ```
 
 For sandbox/development use, you can use:
@@ -60,6 +69,29 @@ TASTY_STREAMER_URL=wss://streamer.cert.tastyworks.com
 ```
 
 ## Basic Usage
+
+### Running a Strategy with Tastytrade
+
+```python
+from api.tastytrade_api import TastytradeAPI
+from broker.tastytrade_broker import TastytradeBroker
+from strategies.spx_iron_condor_strategy import SPXIronCondorStrategy
+
+# Initialize API and broker
+api = TastytradeAPI()
+broker = TastytradeBroker()
+
+# Initialize strategy with the broker
+strategy = SPXIronCondorStrategy(broker)
+
+# Let the strategy select the account
+if not strategy.select_account():
+    print("No accounts found. Please check your credentials.")
+    exit(1)
+
+# Run strategy
+strategy.run()
+```
 
 ### API Client
 
@@ -117,44 +149,57 @@ else:
 # Start streaming service
 broker.start_streaming_service(account_number)
 
-# Create option order
-broker.option_order(
-    account=account_number,
-    underlying_symbol='SPX',
-    action='Buy to Open',
-    option_type='C',
-    quantity=1,
-    dte=0,
-    delta=0.30
+# Find appropriate iron condor strikes
+strikes = broker.select_iron_condor_strikes(
+    underlying_symbol="SPX",
+    expiration_date="2025-02-28",
+    delta_min=0.16,
+    delta_max=0.25,
+    put_wing_cost=0.15,
+    call_wing_cost=0.05,
+    target_put_credit=5.0,
+    target_call_credit=5.0
 )
 
-# Process orders
-broker.process_orders()
+# Execute an iron condor
+trade_info = broker.execute_iron_condor(
+    account_number=account_number,
+    underlying_symbol="SPX",
+    expiration_date="2025-02-28",
+    strikes=strikes,
+    num_contracts=1,
+    credit_price=10.0
+)
 ```
 
-### Using both components with a strategy
+## Creating a New Broker Implementation
+
+The strategy framework is designed to work with any broker implementation that provides the required interface. To create a new broker implementation:
+
+1. Create a new broker class that implements these required methods:
+   - `select_iron_condor_strikes()`
+   - `calculate_max_iron_condor_contracts()`
+   - `scan_for_iron_condor_positions()`
+   - `execute_iron_condor()`
+   - `check_option_exit_condition()`
+   - `close_option_position()`
+   - `start_streaming_service()`
+
+2. Ensure your broker class maintains these attributes:
+   - `accounts`: A dictionary of available accounts
+   - `symbols_to_monitor`: A structure for tracking symbol data
+
+3. Use your new broker with existing strategies:
 
 ```python
-from api.tastytrade_api import TastytradeAPI
-from broker.tastytrade_broker import TastytradeBroker
 from strategies.spx_iron_condor_strategy import SPXIronCondorStrategy
+from your_module import YourCustomBroker
 
-# Initialize components
-api = TastytradeAPI()
-broker = TastytradeBroker()
+# Initialize your custom broker
+broker = YourCustomBroker()
 
-# Initialize strategy
-strategy = SPXIronCondorStrategy(api, broker)
-
-# Let the strategy select the account (uses TASTY_ACCOUNT env var or falls back to first account)
-if not strategy.select_account():
-    print("No accounts found. Please check your credentials.")
-    exit(1)
-
-# Start data streaming
-broker.start_streaming_service(strategy.account_number)
-
-# Run strategy
+# Use with existing strategy
+strategy = SPXIronCondorStrategy(broker)
 strategy.run()
 ```
 
@@ -174,7 +219,7 @@ tastytrade/
 │   ├── price.py                # Price data model
 │   └── symbol.py               # Symbol tracking model
 ├── strategies/
-│   └── spx_iron_condor_strategy.py  # Sample strategy
+│   └── spx_iron_condor_strategy.py  # Broker-agnostic strategy
 ├── .env                        # Environment variables (not in repo)
 ├── .env-session                # Session tokens (not in repo)
 ├── requirements.txt            # Dependencies
@@ -205,7 +250,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Strategy will automatically use the account from the environment variable
-strategy = SPXIronCondorStrategy(api, broker)
+strategy = SPXIronCondorStrategy(broker)
 strategy.select_account()  # Uses TASTY_ACCOUNT or falls back to first account
 ```
 
@@ -228,42 +273,26 @@ broker.api_client.subscribe_to_option_quotes(['SPX250321C04500000'])
 broker.api_client.subscribe_to_equity_quotes(['SPX'])
 ```
 
-### Order Management
+### Strategy Configuration
 
-Advanced order functionality:
-
-```python
-# Create an order with delta targeting
-broker.option_order(
-    account=account_number,
-    underlying_symbol='SPX',
-    action='Buy to Open',
-    option_type='C',
-    quantity=1,
-    dte=0,  # 0 days to expiration
-    delta=0.30,  # Target delta value
-)
-
-# Process pending orders (handles adjustments, monitoring, etc.)
-broker.process_orders()
-```
-
-### Symbol Tracking
-
-The broker tracks price and Greeks data:
+The SPX Iron Condor strategy has several configurable parameters:
 
 ```python
-# Access symbol tracking data
-symbol_data = broker.symbols_to_monitor['SPX']
+# Initialize strategy
+strategy = SPXIronCondorStrategy(broker)
 
-# Get latest prices
-latest_price = symbol_data.prices[-1].midpoint_price if symbol_data.prices else None
-
-# Get trend information
-is_trending_up = symbol_data.is_trending_up
-
-# Get volatility information
-volatility = symbol_data.volatility_sma if symbol_data.greeks else None
+# Configure strategy parameters
+strategy.entry_time_eastern = "10:10"  # Format: "HH:MM"
+strategy.target_delta_min = 0.16
+strategy.target_delta_max = 0.25
+strategy.target_put_credit = 5.0
+strategy.target_call_credit = 5.0
+strategy.put_wing_cost = 0.15
+strategy.call_wing_cost = 0.05
+strategy.exit_threshold = 0.90  # Exit at 90% of credit received
+strategy.exit_confirmation_time = 120  # 2 minutes confirmation period
+strategy.max_buying_power = 100000.0 
+strategy.max_iron_condors = 6
 ```
 
 ## Contributing

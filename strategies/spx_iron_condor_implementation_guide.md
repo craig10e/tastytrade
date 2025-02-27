@@ -1,6 +1,6 @@
 ## SPX 0 DTE Iron Condor Strategy - Implementation Guide
 
-This guide explains how to set up and run the SPX Iron Condor Strategy.
+This guide explains how to set up and run the SPX Iron Condor Strategy using our broker-agnostic architecture.
 
 ### Strategy Overview
 
@@ -21,6 +21,17 @@ This strategy implements 0 DTE (0 Days To Expiration) SPX Iron Condor trades wit
   - Reconstructs trade details for existing positions
   - Applies consistent exit rules to both new and existing positions
 
+### Architecture Overview
+
+The strategy follows a broker-agnostic design pattern:
+
+1. **Strategy Layer**: Contains trading logic but no broker-specific code
+2. **Broker Interface**: Defines methods required by the strategy
+3. **Broker Implementation**: (e.g., TastytradeBroker) implements the interface for a specific platform
+4. **API Layer**: Handles direct communication with the brokerage API
+
+This separation allows the strategy to be used with different brokers by simply implementing a new broker class that conforms to the expected interface.
+
 ### Setup Instructions
 
 1. **Dependencies**:
@@ -30,7 +41,7 @@ This strategy implements 0 DTE (0 Days To Expiration) SPX Iron Condor trades wit
    ```
 
 2. **Configuration**:
-   - Ensure your TastytradeAPI implementation includes the buying power functions
+   - Ensure your broker implementation includes all required methods
    - Configure your account credentials in a secure way using a `.env` file:
    ```
    TASTY_USERNAME=your_username
@@ -41,9 +52,9 @@ This strategy implements 0 DTE (0 Days To Expiration) SPX Iron Condor trades wit
 3. **Starting the Strategy**:
 
 ```python
-from tastytrade_api import TastytradeAPI
-from tastytrade_broker import TastytradeBroker
-from spx_iron_condor_strategy import SPXIronCondorStrategy
+from api.tastytrade_api import TastytradeAPI
+from broker.tastytrade_broker import TastytradeBroker
+from strategies.spx_iron_condor_strategy import SPXIronCondorStrategy
 
 # Initialize API with credentials
 api = TastytradeAPI()
@@ -51,10 +62,10 @@ api = TastytradeAPI()
 # Initialize broker
 broker = TastytradeBroker()
 
-# Initialize strategy
-strategy = SPXIronCondorStrategy(api, broker)
+# Initialize strategy with the broker
+strategy = SPXIronCondorStrategy(broker)
 
-# Let the strategy select the account (uses TASTY_ACCOUNT env var or falls back to first account)
+# Let the strategy select the account
 if not strategy.select_account():
     print("No accounts found. Please check your credentials.")
     exit(1)
@@ -78,44 +89,92 @@ print("Starting the strategy...")
 strategy.run()
 ```
 
+### Required Broker Interface
+
+For a broker implementation to work with the SPX Iron Condor strategy, it must provide the following methods:
+
+1. **select_iron_condor_strikes(underlying_symbol, expiration_date, delta_min, delta_max, put_wing_cost, call_wing_cost, target_put_credit, target_call_credit)**:
+   - Selects appropriate strikes for an iron condor based on delta targets
+   - Returns a dictionary with strike information
+
+2. **calculate_max_iron_condor_contracts(account_number, strikes, max_buying_power, max_contracts, total_credit)**:
+   - Calculates maximum number of contracts based on buying power
+   - Returns an integer for the number of contracts
+
+3. **scan_for_iron_condor_positions(account_number, underlying_symbol, expiration_date)**:
+   - Finds existing iron condor positions
+   - Returns a list of dictionaries with position information
+
+4. **execute_iron_condor(account_number, underlying_symbol, expiration_date, strikes, num_contracts, credit_price)**:
+   - Executes an iron condor trade
+   - Returns a dictionary with trade information
+
+5. **check_option_exit_condition(symbol, original_credit, num_contracts, exit_threshold)**:
+   - Checks if an option position meets exit conditions
+   - Returns a tuple of (should_exit, cost_to_close)
+
+6. **close_option_position(account_number, symbol, quantity, action, order_type)**:
+   - Closes an option position
+   - Returns the order ID if successful, None otherwise
+
+7. **start_streaming_service(account_number)**:
+   - Starts streaming market data for the account
+   - No return value expected
+
+The broker must also maintain these attributes:
+- `accounts`: A dictionary of account numbers to Account objects
+- `symbols_to_monitor`: A structure for tracking symbol data
+
 ### Key Implementation Details
 
-1. **Account Selection**:
-   - The strategy reads the TASTY_ACCOUNT environment variable to determine which account to use
-   - If TASTY_ACCOUNT is not specified or the account is not available, it falls back to the first available account
-   - Validation ensures the selected account exists in the broker's account list
+1. **Strategy Logic**:
+   - The strategy selects and executes iron condor trades based on delta targets
+   - It uses the broker to find appropriate strikes and execute trades
+   - It monitors positions and applies exit rules consistently
 
-2. **Strike Selection**:
-   - The strategy finds options in the 16-25 delta range for both puts and calls
-   - It selects the highest delta put and lowest delta call in this range
-   - Wing strikes are calculated to provide the desired credit amount
+2. **Broker Implementation**:
+   - The broker translates strategy requests into platform-specific actions
+   - It provides data and execution services without exposing API details
+   - It manages platform-specific behavior and quirks
 
-3. **Buying Power Management**:
-   - The strategy retrieves actual buying power from the account balance API
-   - It calculates buying power reduction per iron condor
-   - It determines the maximum number of contracts possible within the available buying power
-   - It caps at 6 iron condors maximum, regardless of buying power
+3. **API Layer**:
+   - The API client handles direct communication with the brokerage platform
+   - It provides methods for authentication, data retrieval, and order submission
+   - It abstracts away HTTP requests, WebSockets, and other low-level details
 
-4. **Position Management**:
-   - Scans for existing iron condor positions during initialization
-   - Retrieves order history to reconstruct entry details for existing positions
-   - Applies the same monitoring and exit rules to both new and existing positions
-   - Avoids creating duplicate positions if positions already exist for today's expiration
+### Creating a New Broker Implementation
 
-5. **Trade Execution**:
-   - Executes at the configured entry time
-   - Creates a 4-leg iron condor order at the calculated credit price
-   - Tracks active trades for monitoring
+To create a broker implementation for a different platform:
 
-6. **Trade Monitoring**:
-   - Continuously monitors both short options separately
-   - Tracks the cost to close each position
-   - If cost to close exceeds 90% of credit received for at least 2 minutes, it exits that side
-   - Allows untested sides to expire worthless
+1. **Create a Broker Class**:
+   - Implement all required methods from the broker interface
+   - Maintain the necessary attributes (accounts, symbols_to_monitor)
+   - Handle platform-specific details and quirks
 
-7. **Logging**:
-   - Comprehensive logging to both console and log file
-   - Tracks all decisions, actions, and trade details
+2. **Create an API Client**:
+   - Implement direct communication with the brokerage API
+   - Handle authentication, data retrieval, and order submission
+   - Manage WebSocket connections if applicable
+
+3. **Example Structure**:
+```python
+class YourBroker:
+    def __init__(self):
+        self.api_client = YourAPIClient()
+        self.accounts = {}
+        self.symbols_to_monitor = {}
+        self._initialize_accounts()
+        
+    def _initialize_accounts(self):
+        # Fetch accounts from API
+        # Populate self.accounts
+        
+    def select_iron_condor_strikes(self, underlying_symbol, expiration_date, delta_min, delta_max, 
+                                 put_wing_cost, call_wing_cost, target_put_credit, target_call_credit):
+        # Implementation specific to your platform
+        
+    # Implement other required methods
+```
 
 ### Customization Options
 
@@ -142,7 +201,7 @@ strategy.exit_threshold = 0.90  # Exit at 90% of credit received
 strategy.exit_confirmation_time = 120  # 2 minutes confirmation period
 
 # Position sizing
-strategy.max_buying_power = 100000.0  # Cap on buying power (actual available BP is used)
+strategy.max_buying_power = 100000.0  # Cap on buying power
 strategy.max_iron_condors = 6
 ```
 
@@ -153,60 +212,70 @@ strategy.max_iron_condors = 6
    - For multi-account setups, you can create different .env files for different configurations
    - Consider implementing account rotation or distribution strategies for large-scale implementations
 
-2. **Reliability**:
-   - Consider implementing error handling for network issues
+2. **Broker Support**:
+   - Ensure your broker implementation handles all edge cases
+   - Test thoroughly with each supported brokerage platform
+   - Consider adding fallback mechanisms for platform-specific failures
+
+3. **Reliability**:
+   - Implement error handling for network issues
    - Add retries for critical API calls
    - Implement a watchdog process to monitor the strategy
 
-3. **Risk Management**:
+4. **Risk Management**:
    - Consider adding additional stop-loss mechanisms
    - Implement circuit breakers for unusual market conditions
    - Add alerts for trade entries and exits
 
-4. **Performance**:
+5. **Performance**:
    - The strategy logs trades and performance
    - Consider implementing a more detailed performance tracking system
    - Store historical trade data for analysis
 
-5. **Testing**:
+6. **Testing**:
    - Test the strategy on paper trading accounts first
    - Verify all calculations and logic
    - Run through multiple scenario tests before going live
 
-6. **Position Recovery**:
+7. **Position Recovery**:
    - The system can now recover state after restarts by scanning existing positions
    - Consider adding a database for more robust state persistence
    - Test the recovery process by intentionally restarting the strategy
 
 ### Troubleshooting
 
-1. **Account Selection Issues**:
+1. **Broker Interface Issues**:
+   - Verify that your broker implementation provides all required methods
+   - Check that method signatures match what the strategy expects
+   - Ensure the broker maintains the required attributes
+
+2. **Account Selection Issues**:
    - Verify that your TASTY_ACCOUNT environment variable is correctly set in .env
    - Check that the account number in TASTY_ACCOUNT matches one of your actual account numbers
    - Ensure you have proper permissions for the selected account
    - Look for warnings in the log about account selection fallbacks
 
-2. **No Strikes Found**:
-   - Check market data connection
+3. **No Strikes Found**:
+   - Check market data connection in your broker implementation
    - Verify that option chain data is being properly received
    - Check if delta data is available for SPX options
 
-3. **Order Execution Issues**:
+4. **Order Execution Issues**:
    - Verify account permissions for SPX options
    - Check account buying power
    - Verify the order structure is correct
 
-4. **Monitoring Issues**:
+5. **Monitoring Issues**:
    - Ensure market data streaming is working
-   - Check for connectivity to the Tastytrade platform
+   - Check for connectivity to the brokerage platform
    - Verify that option prices are being updated correctly
 
-5. **Position Detection Issues**:
+6. **Position Detection Issues**:
    - If existing positions aren't correctly identified, verify API permissions
    - Check the format of symbols to ensure they match expected patterns
    - Review logs for any errors during the position scanning process
 
-6. **Credit Estimation Issues**:
+7. **Credit Estimation Issues**:
    - If credits for existing positions seem incorrect, they might be using default estimates
    - Check if the order history API is functioning correctly
    - Consider manually setting more accurate credit values if needed

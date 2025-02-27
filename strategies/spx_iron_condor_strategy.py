@@ -7,13 +7,13 @@ from typing import Dict, List, Tuple, Optional, Any, Set
 from decimal import Decimal
 from dotenv import load_dotenv
 
-from api.tastytrade_api import TastytradeAPI
-from broker.tastytrade_broker import TastytradeBroker
-
 
 class SPXIronCondorStrategy:
     """
     Implements a 0 DTE SPX Iron Condor trading strategy.
+    
+    This strategy is broker-agnostic and can work with any broker implementation
+    that provides the required interface methods.
     
     The strategy:
     - Trades 0 DTE SPX iron condors at 10:10 AM Eastern time
@@ -32,18 +32,16 @@ class SPXIronCondorStrategy:
     - Applies consistent exit rules to both new and existing positions
     """
     
-    def __init__(self, api: TastytradeAPI, broker: TastytradeBroker):
+    def __init__(self, broker):
         """
-        Initialize the strategy with API and broker instances.
+        Initialize the strategy with a broker instance.
         
         Args:
-            api: Authenticated TastytradeAPI instance
-            broker: TastytradeBroker instance
+            broker: Broker implementation providing required interface methods
         """
         # Load environment variables
         load_dotenv()
         
-        self.api = api
         self.broker = broker
         self.account_number = None
         self.max_buying_power = 100000.0
@@ -85,7 +83,7 @@ class SPXIronCondorStrategy:
         Returns:
             True if an account was successfully selected, False otherwise
         """
-        if not self.broker.accounts:
+        if not hasattr(self.broker, 'accounts') or not self.broker.accounts:
             self.logger.error("No accounts available in broker. Check credentials and permissions.")
             return False
             
@@ -149,28 +147,31 @@ class SPXIronCondorStrategy:
         today = datetime.date.today()
         return today.strftime("%Y-%m-%d")
     
-    def calculate_available_buying_power(self) -> float:
+    def find_option_strikes(self) -> Dict[str, Any]:
         """
-        Get actual available buying power from account.
+        Find appropriate option strikes for the iron condor based on delta targets.
         
         Returns:
-            The available buying power in dollars, capped at max_buying_power
+            Dictionary with strike information.
         """
-        if not self.account_number:
-            return self.max_buying_power
-
-        available_bp = self.api.get_available_buying_power(self.account_number)
+        # Get today's expiration date
+        expiration_date = self.get_current_expiration()
         
-        if available_bp is None:
-            self.logger.warning("Could not retrieve account buying power, using default max")
-            return self.max_buying_power
-
-        self.logger.info(f"Actual available buying power: ${available_bp}")
-        return min(available_bp, self.max_buying_power)
+        # Use the broker to select strikes for an iron condor
+        return self.broker.select_iron_condor_strikes(
+            underlying_symbol="SPX",
+            expiration_date=expiration_date,
+            delta_min=self.target_delta_min,
+            delta_max=self.target_delta_max,
+            put_wing_cost=self.put_wing_cost,
+            call_wing_cost=self.call_wing_cost,
+            target_put_credit=self.target_put_credit,
+            target_call_credit=self.target_call_credit
+        )
     
     def calculate_max_contracts(self, strikes: Dict[str, Any]) -> int:
         """
-        Calculate maximum number of iron condors we can trade based on buying power.
+        Calculate maximum number of iron condors to trade based on buying power.
         
         Args:
             strikes: Dictionary with strike information
@@ -181,36 +182,17 @@ class SPXIronCondorStrategy:
         if not self.account_number or not strikes:
             return 0
         
-        # Get available buying power
-        available_buying_power = self.calculate_available_buying_power()
+        # Calculate the total credit per iron condor
+        total_credit = self.target_put_credit + self.target_call_credit
         
-        # Calculate BPR for one iron condor
-        bpr_per_contract = self.api.calculate_iron_condor_bpr(
+        # Use the broker to calculate max contracts
+        return self.broker.calculate_max_iron_condor_contracts(
             account_number=self.account_number,
-            underlying_symbol="SPX",
-            short_put_strike=strikes["short_put_strike"],
-            long_put_strike=strikes["long_put_strike"],
-            short_call_strike=strikes["short_call_strike"],
-            long_call_strike=strikes["long_call_strike"],
-            expiration_date=strikes["expiration_date"],
-            quantity=1,
-            limit_price=self.target_put_credit + self.target_call_credit  # Total credit
+            strikes=strikes,
+            max_buying_power=self.max_buying_power,
+            max_contracts=self.max_iron_condors,
+            total_credit=total_credit
         )
-        
-        if not bpr_per_contract:
-            self.logger.error("Failed to calculate buying power reduction")
-            return 0
-        
-        self.logger.info(f"Buying power reduction per contract: ${bpr_per_contract:.2f}")
-        
-        # Calculate maximum contracts based on our budget
-        max_contracts = int(available_buying_power / bpr_per_contract)
-        
-        # Cap at our desired maximum
-        max_contracts = min(max_contracts, self.max_iron_condors)
-        
-        self.logger.info(f"Maximum contracts we can trade: {max_contracts}")
-        return max_contracts
     
     def execute_entry(self, strikes: Dict[str, Any], num_contracts: int) -> Dict[str, Any]:
         """
@@ -226,255 +208,80 @@ class SPXIronCondorStrategy:
         if not self.account_number or num_contracts <= 0:
             return {}
         
-        # Prepare option symbols
-        short_put = self.api._prepare_option_symbol(
-            "SPX", strikes["expiration_date"], strikes["short_put_strike"], "P")
-        long_put = self.api._prepare_option_symbol(
-            "SPX", strikes["expiration_date"], strikes["long_put_strike"], "P")
-        short_call = self.api._prepare_option_symbol(
-            "SPX", strikes["expiration_date"], strikes["short_call_strike"], "C")
-        long_call = self.api._prepare_option_symbol(
-            "SPX", strikes["expiration_date"], strikes["long_call_strike"], "C")
-        
         # Calculate total credit
         total_credit = self.target_put_credit + self.target_call_credit
         
-        # Create legs for the order
-        legs = [
-            {"symbol": short_put, "quantity": num_contracts, "action": "Sell to Open", "instrument_type": "Equity Option"},
-            {"symbol": long_put, "quantity": num_contracts, "action": "Buy to Open", "instrument_type": "Equity Option"},
-            {"symbol": short_call, "quantity": num_contracts, "action": "Sell to Open", "instrument_type": "Equity Option"},
-            {"symbol": long_call, "quantity": num_contracts, "action": "Buy to Open", "instrument_type": "Equity Option"}
-        ]
-        
-        # Execute the order
         self.logger.info(f"Executing iron condor with {num_contracts} contracts at ${total_credit:.2f} credit")
         
-        # First do a dry run to confirm everything looks good
-        dry_run_result = self.api.dry_run_option_order(
-            self.account_number, "SPX", legs, order_type="Limit", limit_price=total_credit)
-        
-        if not dry_run_result:
-            self.logger.error("Dry run failed, cancelling trade")
-            return {}
-        
-        if "errors" in dry_run_result and dry_run_result["errors"]:
-            self.logger.error(f"Dry run returned errors: {dry_run_result['errors']}")
-            return {}
-        
-        self.logger.info("Dry run successful, proceeding with actual order")
-        
-        # Submit the actual order using the API
-        response = self.api.create_iron_condor_order(
+        # Use the broker to execute the iron condor
+        trade_info = self.broker.execute_iron_condor(
             account_number=self.account_number,
-            short_put_symbol=short_put,
-            long_put_symbol=long_put,
-            short_call_symbol=short_call,
-            long_call_symbol=long_call,
-            quantity=num_contracts,
+            underlying_symbol="SPX",
+            expiration_date=strikes["expiration_date"],
+            strikes=strikes,
+            num_contracts=num_contracts,
             credit_price=total_credit
         )
         
-        if not response or "data" not in response or "order" not in response["data"]:
-            self.logger.error("Failed to submit order")
+        if not trade_info:
+            self.logger.error("Failed to execute iron condor trade")
             return {}
         
-        order = response["data"]["order"]
-        order_id = order["id"]
-        self.logger.info(f"Order submitted successfully with ID: {order_id}")
+        self.logger.info(f"Order submitted successfully with ID: {trade_info['order_id']}")
         
-        # Track trade details
-        trade = {
-            "order_id": order_id,
-            "num_contracts": num_contracts,
-            "expiration_date": strikes["expiration_date"],
-            "entry_time": datetime.datetime.now(),
-            "put_credit": self.target_put_credit * num_contracts,
-            "call_credit": self.target_call_credit * num_contracts,
-            "total_credit": total_credit * num_contracts,
-            "strikes": {
-                "long_put": strikes["long_put_strike"],
-                "short_put": strikes["short_put_strike"],
-                "short_call": strikes["short_call_strike"],
-                "long_call": strikes["long_call_strike"]
-            },
-            "symbols": {
-                "long_put": long_put,
-                "short_put": short_put,
-                "short_call": short_call,
-                "long_call": long_call
-            },
-            "put_closed": False,
-            "call_closed": False,
-            "put_exit_detected_time": None,
-            "call_exit_detected_time": None
-        }
+        # Add put/call specific credits and exit tracking to the trade info
+        trade_info["put_credit"] = self.target_put_credit * num_contracts
+        trade_info["call_credit"] = self.target_call_credit * num_contracts
+        trade_info["put_closed"] = False
+        trade_info["call_closed"] = False
+        trade_info["put_exit_detected_time"] = None
+        trade_info["call_exit_detected_time"] = None
         
-        self.active_trades.append(trade)
-        return trade
+        self.active_trades.append(trade_info)
+        return trade_info
     
     def initialize_from_existing_positions(self) -> None:
         """
         Scan for and identify existing iron condor positions.
         
-        Finds existing positions, reconstructs their structure, and adds them to
-        the active_trades list for monitoring and management.
+        Uses the broker to find existing positions and adds them
+        to the active_trades list for monitoring and management.
         """
         if not self.account_number:
             return
 
         self.logger.info("Scanning for existing iron condor positions...")
         
-        # Get current positions
-        positions = self.api.get_positions(self.account_number)
-        if not positions:
-            self.logger.info("No positions found")
+        # Use the broker to scan for iron condor positions
+        iron_condors = self.broker.scan_for_iron_condor_positions(
+            account_number=self.account_number,
+            underlying_symbol="SPX",
+            expiration_date=self.get_current_expiration()
+        )
+        
+        if not iron_condors:
+            self.logger.info("No existing iron condor positions found")
             return
-
-        # Keep track of all streamer symbols to add to monitoring
-        streamer_symbols_to_monitor: Set[str] = set()
         
-        # Group positions by expiration date
-        spx_positions_by_expiration = {}
-        today = datetime.date.today().strftime("%Y-%m-%d")
-
-        for position in positions:
-            if position["underlying-symbol"] == "SPX" and position["instrument-type"] == "Equity Option":
-                # Get option details
-                option_info = self.api.get_option_info(position["symbol"])
-                if not option_info or "data" not in option_info:
-                    continue
-
-                option_data = option_info["data"]
-                expiration = option_data.get("expiration-date")
-                
-                # Add to streaming service
-                streamer_symbol = option_data.get("streamer-symbol")
-                if streamer_symbol:
-                    streamer_symbols_to_monitor.add(streamer_symbol)
-
-                # Focus only on today's expiration (0 DTE)
-                if expiration != today:
-                    continue
-
-                if expiration not in spx_positions_by_expiration:
-                    spx_positions_by_expiration[expiration] = []
-
-                spx_positions_by_expiration[expiration].append({
-                    "symbol": position["symbol"],
-                    "quantity": position["quantity"],
-                    "direction": position["quantity-direction"],
-                    "option_type": option_data.get("option-type"),
-                    "strike_price": float(option_data.get("strike-price")),
-                    "streamer_symbol": streamer_symbol,
-                    "average_open_price": float(position.get("average-open-price", 0))
-                })
-
-        # Add all streamer symbols to monitoring if not already monitored
-        for streamer_symbol in streamer_symbols_to_monitor:
-            if streamer_symbol not in self.broker.symbols_to_monitor:
-                self.broker.symbols_to_monitor[streamer_symbol] = self.broker.Symbol(
-                    symbol=None, streamer_symbol=streamer_symbol)
-        
-        # Identify iron condor structures
-        for expiration, positions in spx_positions_by_expiration.items():
-            # Find puts and calls
-            puts = [p for p in positions if p["option_type"] == "P"]
-            calls = [p for p in positions if p["option_type"] == "C"]
-
-            # Sort by strike
-            puts.sort(key=lambda x: x["strike_price"])
-            calls.sort(key=lambda x: x["strike_price"])
-
-            # Look for iron condor structure
-            long_puts = [p for p in puts if p["direction"] == "Long"]
-            short_puts = [p for p in puts if p["direction"] == "Short"]
-            long_calls = [p for p in calls if p["direction"] == "Long"]
-            short_calls = [p for p in calls if p["direction"] == "Short"]
-
-            if long_puts and short_puts and long_calls and short_calls:
-                # Found a potential iron condor
-                self.logger.info(f"Found existing iron condor position for expiration {expiration}")
-                
-                # Get order history to estimate entry time and credits
-                orders = self.api.get_orders(
-                    self.account_number, 
-                    status="all", 
-                    start_date=datetime.date.today() - datetime.timedelta(days=7)
-                )
-                
-                # Look for orders with the same symbols
-                relevant_orders = []
-                if orders and "data" in orders and "items" in orders["data"]:
-                    for order in orders["data"]["items"]:
-                        # Check if this is a related order
-                        if "legs" in order:
-                            order_symbols = [leg.get("symbol") for leg in order["legs"]]
-                            if (short_puts[0]["symbol"] in order_symbols and 
-                                long_puts[0]["symbol"] in order_symbols and 
-                                short_calls[0]["symbol"] in order_symbols and 
-                                long_calls[0]["symbol"] in order_symbols):
-                                relevant_orders.append(order)
-                
-                # Estimate entry time and credits
-                entry_time = datetime.datetime.now() - datetime.timedelta(hours=1)  # Default estimate
-                put_credit = self.target_put_credit  # Default estimate
-                call_credit = self.target_call_credit  # Default estimate
-                
-                # If we found the original order, use its details
-                if relevant_orders:
-                    # Use the oldest order as the entry
-                    oldest_order = min(relevant_orders, key=lambda o: o.get("placed-time", ""))
-                    if "placed-time" in oldest_order:
-                        try:
-                            entry_time = datetime.datetime.fromisoformat(oldest_order["placed-time"].replace("Z", "+00:00"))
-                        except ValueError:
-                            pass  # Fall back to estimate
-                    
-                    # Try to extract actual credits
-                    if "price" in oldest_order:
-                        total_credit = float(oldest_order["price"])
-                        # Split evenly if we can't determine specific allocation
-                        put_credit = total_credit / 2
-                        call_credit = total_credit / 2
-                
-                # Calculate number of contracts (minimum quantity across all legs)
-                num_contracts = min(
-                    abs(long_puts[0]["quantity"]),
-                    abs(short_puts[0]["quantity"]),
-                    abs(short_calls[0]["quantity"]),
-                    abs(long_calls[0]["quantity"])
-                )
-                
-                # Create a trade structure for monitoring
-                trade = {
-                    "order_id": "existing",
-                    "num_contracts": num_contracts,
-                    "expiration_date": expiration,
-                    "entry_time": entry_time,
-                    "put_credit": put_credit * num_contracts,
-                    "call_credit": call_credit * num_contracts,
-                    "total_credit": (put_credit + call_credit) * num_contracts,
-                    "strikes": {
-                        "long_put": long_puts[0]["strike_price"],
-                        "short_put": short_puts[0]["strike_price"],
-                        "short_call": short_calls[0]["strike_price"],
-                        "long_call": long_calls[0]["strike_price"]
-                    },
-                    "symbols": {
-                        "long_put": long_puts[0]["symbol"],
-                        "short_put": short_puts[0]["symbol"],
-                        "short_call": short_calls[0]["symbol"],
-                        "long_call": long_calls[0]["symbol"]
-                    },
-                    "put_closed": False,
-                    "call_closed": False,
-                    "put_exit_detected_time": None,
-                    "call_exit_detected_time": None
-                }
-
-                self.active_trades.append(trade)
-                self.logger.info(f"Added existing iron condor to active trades with {num_contracts} contracts")
+        for ic in iron_condors:
+            # Add monitoring-specific fields to the trade info
+            # Split total credit evenly between put and call sides if not specified
+            total_credit = ic.get("total_credit", 0.0)
+            put_credit = ic.get("put_credit", total_credit / 2)
+            call_credit = ic.get("call_credit", total_credit / 2)
+            
+            trade = {
+                **ic,  # Include all original fields
+                "put_credit": put_credit,
+                "call_credit": call_credit,
+                "put_closed": False,
+                "call_closed": False,
+                "put_exit_detected_time": None,
+                "call_exit_detected_time": None
+            }
+            
+            self.active_trades.append(trade)
+            self.logger.info(f"Added existing iron condor to active trades with {trade['num_contracts']} contracts")
     
     def check_exit_conditions(self) -> None:
         """Check if exit conditions are met for any active trades."""
@@ -483,7 +290,7 @@ class SPXIronCondorStrategy:
             if trade["put_closed"] and trade["call_closed"]:
                 continue
             
-            # Get current prices
+            # Check put and call exit conditions
             if not trade["put_closed"]:
                 self._check_put_exit(trade)
             
@@ -498,33 +305,21 @@ class SPXIronCondorStrategy:
             trade: The trade to check exit conditions for
         """
         short_put_symbol = trade["symbols"]["short_put"]
-        short_put_info = self.api.get_option_info(short_put_symbol)
         
-        if not short_put_info or "data" not in short_put_info:
-            self.logger.warning(f"Failed to get information for short put: {short_put_symbol}")
-            return
+        # Use the broker to check exit condition for the short put
+        should_exit, cost_to_close = self.broker.check_option_exit_condition(
+            symbol=short_put_symbol,
+            original_credit=trade["put_credit"] / trade["num_contracts"],
+            num_contracts=trade["num_contracts"],
+            exit_threshold=self.exit_threshold
+        )
         
-        streamer_symbol = short_put_info["data"]["streamer-symbol"]
-        
-        # Check if we have price data
-        if streamer_symbol not in self.broker.symbols_to_monitor:
-            self.logger.warning(f"No price data for {streamer_symbol}")
-            return
-        
-        symbol_data = self.broker.symbols_to_monitor[streamer_symbol]
-        if not symbol_data.prices:
-            return
-        
-        current_price = symbol_data.prices[-1].ask_price
-        original_credit_per_contract = trade["put_credit"] / trade["num_contracts"]
-        cost_to_close = current_price * trade["num_contracts"]
-        
-        # Check if cost to close exceeds our threshold
-        if cost_to_close >= original_credit_per_contract * self.exit_threshold * trade["num_contracts"]:
+        if should_exit:
             if trade["put_exit_detected_time"] is None:
                 # First time detecting exit condition
                 self.logger.info(f"Put exit condition detected. Cost to close: ${cost_to_close:.2f}, " +
-                               f"Threshold: ${original_credit_per_contract * self.exit_threshold * trade['num_contracts']:.2f}")
+                               f"Original credit: ${trade['put_credit']:.2f}, " +
+                               f"Threshold: ${trade['put_credit'] * self.exit_threshold:.2f}")
                 trade["put_exit_detected_time"] = datetime.datetime.now()
             else:
                 # Check if condition has persisted long enough
@@ -543,33 +338,21 @@ class SPXIronCondorStrategy:
             trade: The trade to check exit conditions for
         """
         short_call_symbol = trade["symbols"]["short_call"]
-        short_call_info = self.api.get_option_info(short_call_symbol)
         
-        if not short_call_info or "data" not in short_call_info:
-            self.logger.warning(f"Failed to get information for short call: {short_call_symbol}")
-            return
+        # Use the broker to check exit condition for the short call
+        should_exit, cost_to_close = self.broker.check_option_exit_condition(
+            symbol=short_call_symbol,
+            original_credit=trade["call_credit"] / trade["num_contracts"],
+            num_contracts=trade["num_contracts"],
+            exit_threshold=self.exit_threshold
+        )
         
-        streamer_symbol = short_call_info["data"]["streamer-symbol"]
-        
-        # Check if we have price data
-        if streamer_symbol not in self.broker.symbols_to_monitor:
-            self.logger.warning(f"No price data for {streamer_symbol}")
-            return
-        
-        symbol_data = self.broker.symbols_to_monitor[streamer_symbol]
-        if not symbol_data.prices:
-            return
-        
-        current_price = symbol_data.prices[-1].ask_price
-        original_credit_per_contract = trade["call_credit"] / trade["num_contracts"]
-        cost_to_close = current_price * trade["num_contracts"]
-        
-        # Check if cost to close exceeds our threshold
-        if cost_to_close >= original_credit_per_contract * self.exit_threshold * trade["num_contracts"]:
+        if should_exit:
             if trade["call_exit_detected_time"] is None:
                 # First time detecting exit condition
                 self.logger.info(f"Call exit condition detected. Cost to close: ${cost_to_close:.2f}, " +
-                               f"Threshold: ${original_credit_per_contract * self.exit_threshold * trade['num_contracts']:.2f}")
+                               f"Original credit: ${trade['call_credit']:.2f}, " +
+                               f"Threshold: ${trade['call_credit'] * self.exit_threshold:.2f}")
                 trade["call_exit_detected_time"] = datetime.datetime.now()
             else:
                 # Check if condition has persisted long enough
@@ -589,20 +372,17 @@ class SPXIronCondorStrategy:
         """
         self.logger.info(f"Closing put side of trade {trade['order_id']}")
         
-        # Create order to buy back short put
+        # Use the broker to close the short put position
         short_put_symbol = trade["symbols"]["short_put"]
         
-        # Use the API to create a market order
-        response = self.api.create_market_order(
+        order_id = self.broker.close_option_position(
             account_number=self.account_number,
             symbol=short_put_symbol,
             quantity=trade["num_contracts"],
-            action="Buy to Close",
-            instrument_type="Equity Option"
+            action="Buy to Close"
         )
         
-        if response and "data" in response and "order" in response["data"]:
-            order_id = response["data"]["order"]["id"]
+        if order_id:
             self.logger.info(f"Successfully closed put side with order ID: {order_id}")
             trade["put_closed"] = True
         else:
@@ -617,20 +397,17 @@ class SPXIronCondorStrategy:
         """
         self.logger.info(f"Closing call side of trade {trade['order_id']}")
         
-        # Create order to buy back short call
+        # Use the broker to close the short call position
         short_call_symbol = trade["symbols"]["short_call"]
         
-        # Use the API to create a market order
-        response = self.api.create_market_order(
+        order_id = self.broker.close_option_position(
             account_number=self.account_number,
             symbol=short_call_symbol,
             quantity=trade["num_contracts"],
-            action="Buy to Close",
-            instrument_type="Equity Option"
+            action="Buy to Close"
         )
         
-        if response and "data" in response and "order" in response["data"]:
-            order_id = response["data"]["order"]["id"]
+        if order_id:
             self.logger.info(f"Successfully closed call side with order ID: {order_id}")
             trade["call_closed"] = True
         else:
@@ -646,7 +423,7 @@ class SPXIronCondorStrategy:
             
         self.logger.info("Starting SPX Iron Condor Strategy")
         
-        # First, ensure we're subscribed to SPX option data
+        # First, ensure we're subscribed to market data
         self.broker.start_streaming_service(self.account_number)
         
         # Scan for existing positions
@@ -730,12 +507,16 @@ class SPXIronCondorStrategy:
 
 # Example usage:
 if __name__ == "__main__":
-    # Initialize API and broker
+    # Import only at usage point to avoid circular imports
+    from api.tastytrade_api import TastytradeAPI
+    from broker.tastytrade_broker import TastytradeBroker
+    
+    # Initialize broker
     api = TastytradeAPI()
     broker = TastytradeBroker()
     
-    # Initialize strategy
-    strategy = SPXIronCondorStrategy(api, broker)
+    # Initialize strategy with the broker
+    strategy = SPXIronCondorStrategy(broker)
     
     # Let the strategy select the account from environment or fall back to first account
     if not strategy.select_account():
