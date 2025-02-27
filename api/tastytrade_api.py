@@ -1001,3 +1001,309 @@ class TastytradeAPI:
         """
         self.heartbeat_thread = threading.Thread(target=self._send_heartbeat, daemon=True)
         self.heartbeat_thread.start()
+
+    def get_account_balance(self, account_number: str) -> Optional[Dict[str, Any]]:
+        """
+        Get account balance information including buying power.
+
+        Args:
+            account_number: The account number to retrieve balance for.
+
+        Returns:
+            Dictionary with account balance data or None if retrieval fails.
+        """
+        if not self.session_token:
+            print("Not logged in.")
+            return None
+
+        return self._request("GET", f"/accounts/{account_number}/balances")
+
+    def get_available_buying_power(self, account_number: str) -> Optional[float]:
+        """
+        Get available derivative buying power for an account.
+
+        Args:
+            account_number: The account number to retrieve buying power for.
+
+        Returns:
+            Available buying power as a float, or None if retrieval fails.
+        """
+        account_balance = self.get_account_balance(account_number)
+
+        if not account_balance or "data" not in account_balance:
+            print("Could not retrieve account balance.")
+            return None
+
+        # The 'derivative-buying-power' field holds available buying power for options
+        available_bp = account_balance["data"].get("derivative-buying-power")
+        if available_bp is not None:
+            return float(available_bp)
+        return None
+
+    def get_orders(
+            self,
+            account_number: str,
+            status: str = "all",
+            start_date: Optional[datetime.date] = None,
+            end_date: Optional[datetime.date] = None,
+            limit: int = 50
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get orders for an account with optional filtering.
+
+        Args:
+            account_number: The account number to retrieve orders for.
+            status: Order status filter ('all', 'open', 'filled', etc.).
+            start_date: Optional start date for filtering.
+            end_date: Optional end date for filtering.
+            limit: Maximum number of orders to return.
+
+        Returns:
+            Dictionary with orders data or None if retrieval fails.
+        """
+        if not self.session_token:
+            print("Not logged in.")
+            return None
+
+        params = {"status": status, "per-page": limit}
+
+        if start_date:
+            params["start-date"] = start_date.strftime("%Y-%m-%d")
+        if end_date:
+            params["end-date"] = end_date.strftime("%Y-%m-%d")
+
+        return self._request("GET", f"/accounts/{account_number}/orders", params=params)
+
+    def calculate_iron_condor_bpr(
+            self,
+            account_number: str,
+            underlying_symbol: str,
+            short_put_strike: float,
+            long_put_strike: float,
+            short_call_strike: float,
+            long_call_strike: float,
+            expiration_date: str,
+            quantity: int = 1,
+            limit_price: Optional[float] = None
+    ) -> Optional[float]:
+        """
+        Calculate buying power reduction for an iron condor.
+
+        Args:
+            account_number: The account number.
+            underlying_symbol: The ticker symbol of the underlying asset.
+            short_put_strike: Strike price of the short put.
+            long_put_strike: Strike price of the long put.
+            short_call_strike: Strike price of the short call.
+            long_call_strike: Strike price of the long call.
+            expiration_date: Expiration date in 'YYYY-MM-DD' format.
+            quantity: Number of contracts.
+            limit_price: Optional limit price for the order.
+
+        Returns:
+            Buying power reduction as a float, or None if calculation fails.
+        """
+        if not self.session_token:
+            print("Not logged in.")
+            return None
+
+        # Prepare option symbols
+        short_put = self._prepare_option_symbol(underlying_symbol, expiration_date, short_put_strike, "P")
+        long_put = self._prepare_option_symbol(underlying_symbol, expiration_date, long_put_strike, "P")
+        short_call = self._prepare_option_symbol(underlying_symbol, expiration_date, short_call_strike, "C")
+        long_call = self._prepare_option_symbol(underlying_symbol, expiration_date, long_call_strike, "C")
+
+        # Create legs for the request
+        legs = [
+            {"symbol": short_put, "quantity": quantity, "action": "Sell to Open", "instrument-type": "Equity Option"},
+            {"symbol": long_put, "quantity": quantity, "action": "Buy to Open", "instrument-type": "Equity Option"},
+            {"symbol": short_call, "quantity": quantity, "action": "Sell to Open", "instrument-type": "Equity Option"},
+            {"symbol": long_call, "quantity": quantity, "action": "Buy to Open", "instrument-type": "Equity Option"}
+        ]
+
+        # Prepare request data
+        data = {
+            "legs": legs,
+            "source": "user"
+        }
+
+        if limit_price is not None:
+            data["price"] = limit_price
+            data["price-effect"] = "Credit"
+            data["order-type"] = "Limit"
+
+        # Make dry run request to calculate BPR
+        response = self._request("POST", f"/accounts/{account_number}/orders/dry-run", data=data)
+
+        if not response or "data" not in response or "buying-power-effect" not in response["data"]:
+            print("Failed to calculate buying power reduction.")
+            return None
+
+        bpr = response["data"]["buying-power-effect"]["change"]["effect"]
+        return abs(float(bpr))  # Return positive value
+
+    def dry_run_option_order(
+            self,
+            account_number: str,
+            underlying_symbol: str,
+            legs: List[Dict[str, Any]],
+            order_type: str = "Limit",
+            limit_price: Optional[float] = None,
+            time_in_force: str = "Day"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Perform a dry run of an option order to check validity.
+
+        Args:
+            account_number: The account number.
+            underlying_symbol: The ticker symbol of the underlying asset.
+            legs: List of order legs, each containing symbol, quantity, action, instrument_type.
+            order_type: 'Limit' or 'Market'.
+            limit_price: Price for limit orders.
+            time_in_force: 'Day', 'GTC', or 'GTD'.
+
+        Returns:
+            Dry run response data, or None if the request fails.
+        """
+        if not self.session_token:
+            print("Not logged in.")
+            return None
+
+        # Prepare request data
+        data = {
+            "source": "user",
+            "order-type": order_type,
+            "time-in-force": time_in_force,
+            "legs": [self._dasherize_keys(leg) for leg in legs]
+        }
+
+        if order_type == "Limit" and limit_price is not None:
+            data["price"] = limit_price
+            data["price-effect"] = "Credit"
+
+        # Make dry run request
+        return self._request("POST", f"/accounts/{account_number}/orders/dry-run", data=data)
+
+    def create_multi_leg_order(
+            self,
+            account_number: str,
+            legs: List[Dict[str, Any]],
+            order_type: str = "Limit",
+            time_in_force: str = "Day",
+            price: Optional[float] = None,
+            price_effect: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create a multi-leg option order.
+
+        Args:
+            account_number: The account number.
+            legs: List of order legs, each containing symbol, quantity, action, instrument_type.
+            order_type: 'Limit' or 'Market'.
+            time_in_force: 'Day', 'GTC', or 'GTD'.
+            price: Price for limit orders.
+            price_effect: 'Credit' or 'Debit' for limit orders.
+
+        Returns:
+            API response for the order creation, or None if creation fails.
+        """
+        if not self.session_token:
+            print("Not logged in.")
+            return None
+
+        # Prepare order data
+        data = {
+            "order-type": order_type,
+            "time-in-force": time_in_force,
+            "legs": [self._dasherize_keys(leg) for leg in legs]
+        }
+
+        if order_type == "Limit" and price is not None:
+            data["price"] = price
+            if price_effect:
+                data["price-effect"] = price_effect
+
+        # Submit the order
+        return self._request("POST", f"/accounts/{account_number}/orders", data=data)
+
+    def create_market_order(
+            self,
+            account_number: str,
+            symbol: str,
+            quantity: int,
+            action: str,
+            instrument_type: str = "Equity Option",
+            time_in_force: str = "Day"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create a simple market order for a single instrument.
+
+        Args:
+            account_number: The account number.
+            symbol: The instrument symbol.
+            quantity: Number of shares or contracts.
+            action: Order action ('Buy to Open', 'Sell to Open', 'Buy to Close', 'Sell to Close').
+            instrument_type: Type of instrument ('Equity Option' or 'Equity').
+            time_in_force: 'Day', 'GTC', or 'GTD'.
+
+        Returns:
+            API response for the order creation, or None if creation fails.
+        """
+        legs = [{
+            "symbol": symbol,
+            "quantity": quantity,
+            "action": action,
+            "instrument_type": instrument_type
+        }]
+
+        return self.create_multi_leg_order(
+            account_number=account_number,
+            legs=legs,
+            order_type="Market",
+            time_in_force=time_in_force
+        )
+
+    def create_iron_condor_order(
+            self,
+            account_number: str,
+            short_put_symbol: str,
+            long_put_symbol: str,
+            short_call_symbol: str,
+            long_call_symbol: str,
+            quantity: int,
+            credit_price: float,
+            time_in_force: str = "Day"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create a four-leg iron condor order.
+
+        Args:
+            account_number: The account number.
+            short_put_symbol: Symbol for the short put.
+            long_put_symbol: Symbol for the long put.
+            short_call_symbol: Symbol for the short call.
+            long_call_symbol: Symbol for the long call.
+            quantity: Number of contracts.
+            credit_price: Limit price for the credit received.
+            time_in_force: 'Day', 'GTC', or 'GTD'.
+
+        Returns:
+            API response for the order creation, or None if creation fails.
+        """
+        legs = [
+            {"symbol": short_put_symbol, "quantity": quantity, "action": "Sell to Open",
+             "instrument_type": "Equity Option"},
+            {"symbol": long_put_symbol, "quantity": quantity, "action": "Buy to Open", "instrument_type": "Equity Option"},
+            {"symbol": short_call_symbol, "quantity": quantity, "action": "Sell to Open",
+             "instrument_type": "Equity Option"},
+            {"symbol": long_call_symbol, "quantity": quantity, "action": "Buy to Open", "instrument_type": "Equity Option"}
+        ]
+
+        return self.create_multi_leg_order(
+            account_number=account_number,
+            legs=legs,
+            order_type="Limit",
+            time_in_force=time_in_force,
+            price=credit_price,
+            price_effect="Credit"
+        )
